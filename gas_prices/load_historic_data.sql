@@ -1,7 +1,42 @@
-CREATE OR REPLACE SCRIPT &STAGESCM..LOAD_GAS_PRICE_DATA AS
+-- working with opening time column 
+import into &STAGESCM..PRICES from csv at 'https://dev.azure.com/tankerkoenig/362e70d1-bafa-4cf7-a346-1f3613304973/_apis/git/repositories/0d6e7286-91e4-402c-af56-fa75be1f223d/Items?path=/prices/2019/11/' file '2019-11-12-prices.csv' (1 FORMAT='YYYY-MM-DD HH:MI:SS',2..8) COLUMN SEPARATOR = ',' ENCODING = 'UTF-8' row separator = 'LF' skip = 1 REJECT LIMIT 0;
 
-local date_table = os.date("*t")
-local c_year,c_month,c_day = date_table.year, date_table.month, date_table.day-1
+create or replace python scalar script &STAGESCM..json_parsing_time_periods(OPENINGTIMES_JSON VARCHAR(2000000)) 
+emits (applicable_days int,start_time varchar(10),end_time varchar(10)) as
+import json
+def run(ctx):
+    opening_times = ctx.OPENINGTIMES_JSON
+    if len(opening_times) != 0:
+      js = json.loads(opening_times)
+      if 'openingTimes' in js:
+            for x in range(0,len(js['openingTimes'])):
+                    applicable_days = js['openingTimes'][x]['applicable_days']
+                    start_time = js['openingTimes'][x]['periods'][0]['startp']
+                    end_time = js['openingTimes'][x]['periods'][0]['endp']                
+                    ctx.emit(applicable_days,start_time,end_time)
+/
+
+
+create or replace python scalar script &STAGESCM..json_parsing_closing_periods(CLOSINGTIMES_JSON VARCHAR(2000000)) 
+emits (start_time varchar(30),end_time varchar(30)) as
+import json
+def run(ctx):
+    closing_times = ctx.CLOSINGTIMES_JSON
+    if len(closing_times) != 0:
+      js = json.loads(closing_times)
+      if 'overrides' in js:
+        for y in range(0,len(js['overrides'])):
+            start_time = js['overrides'][y]['startp']
+            end_time = js['overrides'][y]['endp']                
+            ctx.emit(start_time,end_time)
+/
+
+--load script
+
+-- script to auto load data from repository
+-- currently set to load data from previous day
+
+CREATE OR REPLACE SCRIPT &STAGESCM..LOAD_GAS_PRICE_DATA(c_year,c_month,c_day) AS
 
 -- add trailing zero to month and day if length is one
 if string.len(c_month) < 2 then
@@ -50,7 +85,6 @@ query(
 (SELECT UUID,OPENINGTIMES_JSON FROM &STAGESCM..STATIONS WHERE UUID NOT IN (SELECT UUID FROM &PRODSCM..STATIONS))
 SELECT UUID,&STAGESCM..json_parsing_closing_periods(OPENINGTIMES_JSON) FROM TMP);]]
 )
----- 
 
 ----***PRICES***-----
 -- delete all previous data from pricing staging table
@@ -85,38 +119,4 @@ else
 end
 /
 
-EXECUTE SCRIPT &STAGESCM..LOAD_GAS_PRICE_DATA WITH OUTPUT;
 
--- working with opening time column 
-
-import into &STAGESCM..PRICES from csv at 'https://dev.azure.com/tankerkoenig/362e70d1-bafa-4cf7-a346-1f3613304973/_apis/git/repositories/0d6e7286-91e4-402c-af56-fa75be1f223d/Items?path=/prices/2019/11/' file '2019-11-12-prices.csv' (1 FORMAT='YYYY-MM-DD HH:MI:SS',2..8) COLUMN SEPARATOR = ',' ENCODING = 'UTF-8' row separator = 'LF' skip = 1 REJECT LIMIT 0;
-
-create or replace python scalar script &STAGESCM..json_parsing_time_periods(OPENINGTIMES_JSON VARCHAR(2000000)) 
-emits (applicable_days int,start_time varchar(10),end_time varchar(10)) as
-import json
-def run(ctx):
-    opening_times = ctx.OPENINGTIMES_JSON
-    if len(opening_times) != 0:
-      js = json.loads(opening_times)
-      if 'openingTimes' in js:
-            for x in range(0,len(js['openingTimes'])):
-                    applicable_days = js['openingTimes'][x]['applicable_days']
-                    start_time = js['openingTimes'][x]['periods'][0]['startp']
-                    end_time = js['openingTimes'][x]['periods'][0]['endp']                
-                    ctx.emit(applicable_days,start_time,end_time)
-/
-
-
-create or replace python scalar script &STAGESCM..json_parsing_closing_periods(CLOSINGTIMES_JSON VARCHAR(2000000)) 
-emits (start_time varchar(30),end_time varchar(30)) as
-import json
-def run(ctx):
-    closing_times = ctx.CLOSINGTIMES_JSON
-    if len(closing_times) != 0:
-      js = json.loads(closing_times)
-      if 'overrides' in js:
-        for y in range(0,len(js['overrides'])):
-            start_time = js['overrides'][y]['startp']
-            end_time = js['overrides'][y]['endp']                
-            ctx.emit(start_time,end_time)
-/
