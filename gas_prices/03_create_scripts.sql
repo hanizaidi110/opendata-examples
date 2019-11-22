@@ -30,6 +30,15 @@ def run(ctx):
             ctx.emit(start_time,end_time)
 /
 
+--script to checks if file exists on server
+CREATE OR REPLACE PYTHON SCALAR SCRIPT &STAGESCM..if_file_exists(hostname varchar(2000000))
+emits (val int) as
+import requests
+def run(ctx):
+   request = requests.get(ctx.hostname,verify=False)
+   ctx.emit(request.status_code)
+/
+
 -- load script
 -- script to auto load data from repository
 -- currently set to load data from previous day
@@ -68,29 +77,32 @@ wrapper:set_param('FILE_NAME_STATIONS',wrapper:get_param('C_YEAR')..[[-]]..wrapp
 -- delete all previous data from stations staging table
 wrapper:query([[truncate table ::STAGE_SCM.STATIONS]])
 
---import new data in stations staging table
-
-_,res = wrapper:query([[import into ::STAGE_SCM.STATIONS FROM CSV AT :SITE_URL_STATIONS FILE :FILE_NAME_STATIONS COLUMN SEPARATOR = ',' ENCODING = 'UTF-8' row separator='LF' TRIM SKIP=]]..wrapper:get_param('SKIP_ROWS')..[[ ERRORS INTO ::STAGE_SCM.::STAGE_ERROR_TBL REJECT LIMIT :ACCEPTED_ERRORS_PER_FILE;]])
-if (res.etl_rows_with_error > 0) then
+-- check if requested stations file exists on server
+_,t = wrapper:query([[SELECT ::STAGE_SCM.if_file_exists(']]..wrapper:get_param('SITE_URL_STATIONS')..wrapper:get_param('FILE_NAME_STATIONS')..[[') res FROM dual]])
+if (tostring(t[1][1]) == '200') then 
+	--import new data in stations staging table
+	_,res = wrapper:query([[import into ::STAGE_SCM.STATIONS FROM CSV AT :SITE_URL_STATIONS FILE :FILE_NAME_STATIONS COLUMN SEPARATOR = ',' ENCODING = 'UTF-8' row separator='LF' TRIM SKIP=]]..wrapper:get_param('SKIP_ROWS')..[[ ERRORS INTO ::STAGE_SCM.::STAGE_ERROR_TBL REJECT LIMIT :ACCEPTED_ERRORS_PER_FILE;]])
+	if (res.etl_rows_with_error > 0) then
 		wrapper:log('WARN','FILE found rows with errors',res.etl_rows_with_error)
-end	
-
--- strip first_active column to match timestamp format
-wrapper:query([[UPDATE ::STAGE_SCM.STATIONS SET FIRST_ACTIVE=SUBSTRING(FIRST_ACTIVE,0,19);]])
-
--- merge into stations production table
-wrapper:query([[merge into ::PROD_SCM.STATIONS tgt using ::STAGE_SCM.STATIONS src on TGT.UUID = src.UUID when not matched then insert (UUID,NAME,BRAND,STREET,HOUSE_NUMBER,POST_CODE,CITY,LATITUDE,LONGITUDE,FIRST_ACTIVE) values (UUID,NAME,BRAND,STREET,HOUSE_NUMBER,POST_CODE,CITY,LATITUDE,LONGITUDE,FIRST_ACTIVE);]])
-
--- convert first_active column values from UTC timezone to Berlin timezone
-wrapper:query([[UPDATE ::PROD_SCM.STATIONS SET FIRST_ACTIVE = CONVERT_TZ(FIRST_ACTIVE,'UTC','Europe/Berlin');]]) 
-
--- solve for opening and closing times ---
--- insert all new opening times in opening_periods prod table
-wrapper:query([[insert into ::PROD_SCM.OPENING_PERIODS(UUID,APPLICABLE_DAYS,START_TIME,END_TIME) (with tmp as (SELECT UUID,OPENINGTIMES_JSON FROM ::STAGE_SCM.STATIONS WHERE UUID NOT IN (SELECT UUID FROM ::PROD_SCM.STATIONS)) SELECT UUID,::STAGE_SCM.json_parsing_time_periods(OPENINGTIMES_JSON) FROM TMP);]])
-
--- insert all new closing times in closing_periods prod table
-wrapper:query([[insert into ::PROD_SCM.CLOSING_PERIODS(UUID,START_TIME,END_TIME) (with tmp as(SELECT UUID,OPENINGTIMES_JSON FROM ::STAGE_SCM.STATIONS WHERE UUID NOT IN (SELECT UUID FROM ::PROD_SCM.STATIONS))SELECT UUID,::STAGE_SCM.json_parsing_closing_periods(OPENINGTIMES_JSON) FROM TMP);]])
-
+	end		
+	-- strip first_active column to match timestamp format
+	wrapper:query([[UPDATE ::STAGE_SCM.STATIONS SET FIRST_ACTIVE=SUBSTRING(FIRST_ACTIVE,0,19);]])
+	
+	-- merge into stations production table
+	wrapper:query([[merge into ::PROD_SCM.STATIONS tgt using ::STAGE_SCM.STATIONS src on TGT.UUID = src.UUID when not matched then insert (UUID,NAME,BRAND,STREET,HOUSE_NUMBER,POST_CODE,CITY,LATITUDE,LONGITUDE,FIRST_ACTIVE) values (UUID,NAME,BRAND,STREET,HOUSE_NUMBER,POST_CODE,CITY,LATITUDE,LONGITUDE,FIRST_ACTIVE);]])
+	
+	-- convert first_active column values from UTC timezone to Berlin timezone
+	wrapper:query([[UPDATE ::PROD_SCM.STATIONS SET FIRST_ACTIVE = CONVERT_TZ(FIRST_ACTIVE,'UTC','Europe/Berlin');]]) 
+	
+	-- solve for opening and closing times ---
+	-- insert all new opening times in opening_periods prod table
+	wrapper:query([[insert into ::PROD_SCM.OPENING_PERIODS(UUID,APPLICABLE_DAYS,START_TIME,END_TIME) (with tmp as (SELECT UUID,OPENINGTIMES_JSON FROM ::STAGE_SCM.STATIONS WHERE UUID NOT IN (SELECT UUID FROM ::PROD_SCM.STATIONS)) SELECT UUID,::STAGE_SCM.json_parsing_time_periods(OPENINGTIMES_JSON) FROM TMP);]])
+	
+	-- insert all new closing times in closing_periods prod table
+	wrapper:query([[insert into ::PROD_SCM.CLOSING_PERIODS(UUID,START_TIME,END_TIME) (with tmp as(SELECT UUID,OPENINGTIMES_JSON FROM ::STAGE_SCM.STATIONS WHERE UUID NOT IN (SELECT UUID FROM ::PROD_SCM.STATIONS))SELECT UUID,::STAGE_SCM.json_parsing_closing_periods(OPENINGTIMES_JSON) FROM TMP);]])
+else
+	wrapper:log('WARN',[[Followng stations file ]]..wrapper:get_param('FILE_NAME_STATIONS')..[[ does not exists on server]])
+end
 
 ----***PRICES***-----
 wrapper:set_param('SITE_URL_PRICES',wrapper:get_param('SITE_URL')..[[/prices/]]..wrapper:get_param('C_YEAR')..[[/]]..wrapper:get_param('C_MONTH')..[[/]])
@@ -102,24 +114,31 @@ wrapper:query([[truncate table ::STAGE_SCM.PRICES]])
 -- insert check making sure data is not added twice
 _,restab = wrapper:query([[SELECT last_load_date from &STAGESCM..loading_dates]])
 if ("'"..c_year.."-"..c_month.."-"..c_day.."'" ~= "'"..tostring(restab[1][1]).."'") then 
+	-- check if requested stations file exists on server
+	_,tab = wrapper:query([[SELECT ::STAGE_SCM.if_file_exists(']]..wrapper:get_param('SITE_URL_PRICES')..wrapper:get_param('FILE_NAME_PRICES')..[[') res FROM dual]])
+	if (tostring(tab[1][1]) == '200') then 
+		-- import new data in pricing staging table
+	    _,res = wrapper:query([[import into ::STAGE_SCM.PRICES FROM CSV AT :SITE_URL_PRICES FILE :FILE_NAME_PRICES COLUMN SEPARATOR = ',' ENCODING = 'UTF-8' row separator='LF' TRIM SKIP=]]..wrapper:get_param('SKIP_ROWS')..[[ ERRORS INTO ::STAGE_SCM.::STAGE_ERROR_TBL REJECT LIMIT :ACCEPTED_ERRORS_PER_FILE;]])
+		if (res.etl_rows_with_error > 0) then
+			wrapper:log('WARN','FILE found rows with errors',res.etl_rows_with_error)
+		end	
 	
-	-- import new data in pricing staging table
-    _,res = wrapper:query([[import into ::STAGE_SCM.PRICES FROM CSV AT :SITE_URL_PRICES FILE :FILE_NAME_PRICES COLUMN SEPARATOR = ',' ENCODING = 'UTF-8' row separator='LF' TRIM SKIP=]]..wrapper:get_param('SKIP_ROWS')..[[ ERRORS INTO ::STAGE_SCM.::STAGE_ERROR_TBL REJECT LIMIT :ACCEPTED_ERRORS_PER_FILE;]])
-	if (res.etl_rows_with_error > 0) then
-		wrapper:log('WARN','FILE found rows with errors',res.etl_rows_with_error)
-	end	
-
-	-- strip MODIFICATION_TIME column to match timestamp format
-	wrapper:query([[UPDATE ::STAGE_SCM.PRICES SET MODIFICATION_TIME=SUBSTRING(MODIFICATION_TIME,0,19);]])
+		-- strip MODIFICATION_TIME column to match timestamp format
+		wrapper:query([[UPDATE ::STAGE_SCM.PRICES SET MODIFICATION_TIME=SUBSTRING(MODIFICATION_TIME,0,19);]])
+		
+		-- insert into production table 
+		wrapper:query([[insert into ::PROD_SCM.PRICES(MODIFICATION_TIME, UUID, DIESEL, E5, E10, DIESEL_CHANGE, E5_CHANGE, E10_CHANGE) select MODIFICATION_TIME, UUID, DIESEL, E5, E10, DIESEL_CHANGE, E5_CHANGE, E10_CHANGE from ::STAGE_SCM.PRICES WHERE UUID IN (SELECT UUID FROM ::PROD_SCM.STATIONS);]])
+		
+		-- convert MODIFICATION_TIME column values from UTC timezone to Berlin timezone
+		wrapper:query([[UPDATE ::PROD_SCM.PRICES SET MODIFICATION_TIME = CONVERT_TZ(MODIFICATION_TIME,'UTC','Europe/Berlin');]]) 
 	
-	-- insert into production table 
-	wrapper:query([[insert into ::PROD_SCM.PRICES(MODIFICATION_TIME, UUID, DIESEL, E5, E10, DIESEL_CHANGE, E5_CHANGE, E10_CHANGE) select MODIFICATION_TIME, UUID, DIESEL, E5, E10, DIESEL_CHANGE, E5_CHANGE, E10_CHANGE from ::STAGE_SCM.PRICES WHERE UUID IN (SELECT UUID FROM ::PROD_SCM.STATIONS);]])
-	
-	-- convert MODIFICATION_TIME column values from UTC timezone to Berlin timezone
-	wrapper:query([[UPDATE ::PROD_SCM.PRICES SET MODIFICATION_TIME = CONVERT_TZ(MODIFICATION_TIME,'UTC','Europe/Berlin');]]) 
-
-	-- update loading_dates 
-	wrapper:query([[UPDATE &STAGESCM..loading_dates SET LAST_LOAD_DATE=']]..wrapper:get_param('C_YEAR')..[[-]]..wrapper:get_param('C_MONTH')..[[-]]..wrapper:get_param('C_DAY')..[[';]])
+		-- update loading_dates 
+		wrapper:query([[UPDATE &STAGESCM..loading_dates SET LAST_LOAD_DATE=']]..wrapper:get_param('C_YEAR')..[[-]]..wrapper:get_param('C_MONTH')..[[-]]..wrapper:get_param('C_DAY')..[[';]])
+	else
+		wrapper:log('WARN',[[Followng stations file ]]..wrapper:get_param('FILE_NAME_PRICES')..[[ does not exists on server]])
+	end
+else
+	wrapper:log('WARN',[[Price data for the followng stations file ]]..wrapper:get_param('FILE_NAME_PRICES')..[[ already exists in database]])
 end
 
 return wrapper:finish()
